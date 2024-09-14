@@ -4,154 +4,250 @@ import requests
 import json
 import re
 import argparse
-import urllib.error
+import hashlib
+import logging
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from colored import fg, bg, attr
+from colored import fg, attr
+
+# ---------------------------- #
+#        Configuration         #
+# ---------------------------- #
+
+def setup_logging(output_dir):
+    """
+    Sets up logging with separate handlers for file and console.
+    - File Handler: DEBUG level and above (captures all logs)
+    - Console Handler: INFO level and above (excludes DEBUG)
+    """
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    # File handler - captures all logs
+    log_file = os.path.join(output_dir, 'smugmug_downloader.log')
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.DEBUG)
+    fh_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fh_formatter)
+    logger.addHandler(fh)
+
+    # Console handler - INFO and above
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch_formatter = logging.Formatter('%(message)s')  # Clean console output
+    ch.setFormatter(ch_formatter)
+    logger.addHandler(ch)
+
+# ---------------------------- #
+#        Argument Parsing      #
+# ---------------------------- #
 
 parser = argparse.ArgumentParser(description="SmugMug Downloader")
 parser.add_argument(
-    "-s", "--session", help="session ID (required if user is password protected); log in on a web browser and paste the SMSESS cookie")
+    "-s", "--session", help="Session ID (required if user is password protected); log in on a web browser and paste the SMSESS cookie")
 parser.add_argument(
-    "-u", "--user", help="username (from URL, USERNAME.smugmug.com)", required=True)
+    "-u", "--user", help="Username (from URL, USERNAME.smugmug.com)", required=True)
 parser.add_argument("-o", "--output", default="output/",
-                    help="output directory")
+                    help="Output directory")
 parser.add_argument(
-    "--albums", help="specific album names to download, split by $. Defaults to all. Wrap in single quotes to avoid shell variable substitutions. (e.g. --albums 'Title 1$Title 2$Title 3')")
+    "--albums", help="Specific album names to download, split by $. Defaults to all. Wrap in single quotes to avoid shell variable substitutions. (e.g. --albums 'Title 1$Title 2$Title 3')")
 
 args = parser.parse_args()
 
+# ---------------------------- #
+#           Setup              #
+# ---------------------------- #
+
 endpoint = "https://www.smugmug.com"
 
-# Session ID (required if user is password protected)
-# Log in on a web browser and copy the SMSESS cookie
 SMSESS = args.session
 
-cookies = {"SMSESS": SMSESS}
-
-if args.output[-1:] != "/" and args.output[-1:] != "\\":
-    output_dir = args.output + "/"
+if SMSESS:
+    cookies = {"SMSESS": SMSESS}
+    print("Using provided SMSESS cookie for authentication.")
 else:
-    output_dir = args.output
+    cookies = {}
+    print("No SMSESS cookie provided. Proceeding without authentication.")
+
+output_dir = args.output.rstrip(os.sep)
+
+# Create output directory if it doesn't exist
+if not os.path.exists(output_dir):
+    try:
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+    except OSError as e:
+        print(f"ERROR: Could not create output directory {output_dir}: {e}")
+        sys.exit(1)
+
+# Setup logging after ensuring output directory exists
+setup_logging(output_dir)
+logging.info("Starting SmugMug Downloader.")
 
 if args.albums:
-    specificAlbums = [x.strip() for x in args.albums.split('$')]
+    specific_albums = [x.strip() for x in args.albums.split('$')]
+    logging.info(f"Specific albums to download: {specific_albums}")
+else:
+    specific_albums = []
+    logging.info("No specific albums specified. Will download all albums.")
 
+# ---------------------------- #
+#        Helper Functions      #
+# ---------------------------- #
 
-# Gets the JSON output from an API call
 def get_json(url):
+    """
+    Retrieves JSON data from a given URL with retries.
+    """
     num_retries = 5
     for i in range(num_retries):
         try:
             r = requests.get(endpoint + url, cookies=cookies)
+            r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
             pres = soup.find_all("pre")
+            if not pres:
+                raise ValueError("No <pre> tags found in response.")
             return json.loads(pres[-1].text)
-        except (IndexError, requests.exceptions.RequestException):
-            print("ERROR: JSON output not found for URL: %s" % url)
-            if i+1 < num_retries:
-                print("Retrying...")
+        except Exception as e:
+            logging.error(f"Error fetching JSON from URL {endpoint + url}: {e}")
+            if i + 1 < num_retries:
+                logging.info("Retrying...")
             else:
-                print("ERROR: Retries unsuccessful. Skipping this request.")
-            continue
+                logging.error("Max retries reached. Skipping this request.")
     return None
 
+def sanitize_filename(filename):
+    """
+    Sanitizes the filename by replacing unwanted characters with underscores.
+    """
+    return re.sub(r'[^\w\-_\. ]', '_', filename)
+
+# ---------------------------- #
+#       Main Script Logic      #
+# ---------------------------- #
 
 # Retrieve the list of albums
-print("Downloading album list...", end="")
-albums = get_json("/api/v2/folder/user/%s!albumlist" % args.user)
-if albums is None:
-    print("ERROR: Could not retrieve album list.")
+logging.info("Retrieving album list...")
+albums_data = get_json(f"/api/v2/folder/user/{args.user}!albumlist")
+if albums_data is None:
+    logging.error("Could not retrieve album list. Exiting.")
     sys.exit(1)
-print("done.")
+logging.info("Album list retrieved successfully.")
 
-# Quit if no albums were found
+# Process album list
 try:
-    albums["Response"]["AlbumList"]
+    album_list = albums_data["Response"]["AlbumList"]
+    if not album_list:
+        logging.warning(f"No albums found for user {args.user}. Exiting.")
+        sys.exit(1)
 except KeyError:
-    sys.exit("No albums were found for the user %s. The user may not exist or may be password protected." % args.user)
-
-# Create output directories
-print("Creating output directories...", end="")
-for album in albums["Response"]["AlbumList"]:
-    if args.albums:
-        if album["Name"].strip() not in specificAlbums:
-            continue
-
-    directory = output_dir + album["UrlPath"][1:]
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-print("done.")
-
-
-def format_label(s, width=24):
-    return s[:width].ljust(width)
-
-
-bar_format = '{l_bar}{bar:-2}| {n_fmt:>3}/{total_fmt:<3}'
+    logging.error(f"No albums were found for the user {args.user}. The user may not exist or may be password protected.")
+    sys.exit(1)
 
 # Loop through each album
-for album in tqdm(albums["Response"]["AlbumList"], position=0, leave=True, bar_format=bar_format,
-                  desc=f"{fg('yellow')}{attr('bold')}{format_label('All Albums')}{attr('reset')}"):
-    if args.albums:
-        if album["Name"].strip() not in specificAlbums:
-            continue
-
-    album_path = output_dir + album["UrlPath"][1:]
-    images = get_json(album["Uri"] + "!images")
-    if images is None:
-        print("ERROR: Could not retrieve images for album %s (%s)" %
-              (album["Name"], album["Uri"]))
+for album in tqdm(album_list, desc="Albums", unit="album"):
+    album_name = album.get("Name", "Unnamed_Album").strip()
+    if specific_albums and album_name not in specific_albums:
         continue
 
-    # Skip if no images are in the album
-    if "AlbumImage" in images["Response"]:
+    album_url_path = album.get("UrlPath", "").lstrip('/')
+    if not album_url_path:
+        logging.warning(f"Album '{album_name}' has no UrlPath. Skipping.")
+        continue
 
-        # Loop through each page of the album
-        next_images = images
-        while "NextPage" in next_images["Response"]["Pages"]:
-            next_images = get_json(
-                next_images["Response"]["Pages"]["NextPage"])
-            if next_images is None:
-                print("ERROR: Could not retrieve images page for album %s (%s)" %
-                      (album["Name"], album["Uri"]))
-                continue
-            images["Response"]["AlbumImage"].extend(
-                next_images["Response"]["AlbumImage"])
+    album_path = os.path.join(output_dir, album_url_path)
+    if not os.path.exists(album_path):
+        try:
+            os.makedirs(album_path)
+            logging.info(f"Created directory: {album_path}")
+        except OSError as e:
+            logging.error(f"Could not create directory {album_path}: {e}")
+            continue
 
-        # Loop through each image in the album
-        for image in tqdm(images["Response"]["AlbumImage"], position=1, leave=True, bar_format=bar_format,
-                          desc=f"{attr('bold')}{format_label(album['Name'])}{attr('reset')}"):
-            image_path = album_path + "/" + \
-                re.sub(r'[^\w\-_\. ]', '_', image["FileName"])
+    # Retrieve images in the album
+    images_data = get_json(f"{album.get('Uri')}!images")
+    if images_data is None:
+        logging.error(f"Could not retrieve images for album '{album_name}'. Skipping.")
+        continue
 
-            # Skip if image has already been saved
-            if os.path.isfile(image_path):
-                continue
+    images = images_data.get("Response", {}).get("AlbumImage", [])
+    if not images:
+        logging.info(f"No images found in album '{album_name}'. Skipping.")
+        continue
 
-            # Grab video URI if the file is video, otherwise, the standard image URI
-            largest_media = "LargestVideo" if "LargestVideo" in image["Uris"] else "ImageDownload" if "ImageDownload" in image["Uris"] else "LargestImage"
-            if largest_media in image["Uris"]:
-                image_req = get_json(image["Uris"][largest_media]["Uri"])
-                if image_req is None:
-                    print("ERROR: Could not retrieve image for %s" %
-                          image["Uris"][largest_media]["Uri"])
+    # Handle pagination
+    next_page_url = images_data["Response"]["Pages"].get("NextPage")
+    while next_page_url:
+        next_images_data = get_json(next_page_url)
+        if next_images_data is None:
+            logging.error(f"Could not retrieve next page for album '{album_name}'.")
+            break
+        next_images = next_images_data.get("Response", {}).get("AlbumImage", [])
+        images.extend(next_images)
+        next_page_url = next_images_data["Response"]["Pages"].get("NextPage")
+
+    # Loop through each image
+    for image in tqdm(images, desc=f"Album: {album_name}", unit="image", leave=False):
+        # Get unique identifier
+        unique_id = image.get('ArchivedMD5') or image.get('MD5Sum')
+        if not unique_id:
+            unique_id = image.get('id')
+            if not unique_id:
+                image_uri = image.get('Uri', '')
+                if image_uri:
+                    unique_id = hashlib.sha256(image_uri.encode('utf-8')).hexdigest()
+                    logging.warning(f"Image in album '{album_name}' is missing 'id' and 'ArchivedMD5'. Using hash of 'Uri' as unique identifier.")
+                else:
+                    logging.error(f"Image in album '{album_name}' is missing 'id', 'ArchivedMD5', and 'Uri'. Skipping image.")
                     continue
-                download_url = image_req["Response"][largest_media]["Url"]
-            else:
-                # grab archive link if there's no LargestImage URI
-                download_url = image["ArchivedUri"]
 
-            try:
-                r = requests.get(download_url, cookies=cookies)
-                with open(image_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=128):
+        # Get filename
+        file_name = image.get("FileName", "unknown_filename")
+        sanitized_filename = sanitize_filename(file_name)
+        name, ext = os.path.splitext(sanitized_filename)
+        short_unique_id = unique_id[:8]
+        unique_filename = f"{name}_{short_unique_id}{ext}"
+        image_path = os.path.join(album_path, unique_filename)
+
+        # Check if image already exists
+        if os.path.isfile(image_path):
+            continue  # Already downloaded
+
+        # Determine download URL
+        largest_media = None
+        if "LargestVideo" in image["Uris"]:
+            largest_media = "LargestVideo"
+        elif "ImageDownload" in image["Uris"]:
+            largest_media = "ImageDownload"
+        elif "LargestImage" in image["Uris"]:
+            largest_media = "LargestImage"
+
+        if largest_media and largest_media in image["Uris"]:
+            image_req = get_json(image["Uris"][largest_media]["Uri"])
+            if image_req is None:
+                logging.error(f"Could not retrieve image data for {image['Uris'][largest_media]['Uri']}. Skipping image.")
+                continue
+            download_url = image_req["Response"][largest_media]["Url"]
+        else:
+            # Use archive link if no suitable URI found
+            download_url = image.get("ArchivedUri")
+            if not download_url:
+                logging.error(f"No download URL found for image '{unique_filename}' in album '{album_name}'. Skipping image.")
+                continue
+
+        # Download the image
+        try:
+            response = requests.get(download_url, cookies=cookies, stream=True)
+            response.raise_for_status()
+            with open(image_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
                         f.write(chunk)
-            except requests.exceptions.RequestException as ex:
-                print("Could not fetch: " + str(ex))
-            except UnicodeEncodeError as ex:
-                print("Unicode Error: " + str(ex))
-            except urllib.error.HTTPError as ex:
-                print("HTTP Error: " + str(ex))
+            logging.debug(f"Downloaded image: {image_path}")
+        except Exception as e:
+            logging.error(f"Could not fetch image from {download_url}: {e}")
+            continue
 
+logging.info("All downloads completed successfully.")
 print("Completed.")
