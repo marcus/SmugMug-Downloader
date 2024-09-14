@@ -7,6 +7,12 @@ Download all of the pictures from a SmugMug user, including password-protected u
 * Install the requirements:  `pip install -r requirements.txt`
 * NOTE: If you are on Linux, you will probably need to type `pip3` and `python3` instead
 
+## Changes in this version
+
+	•	Logging: A logging system has been implemented. Logs will be written to the file smugmug_downloader.log in the output directory, and only INFO level messages and above will be shown in the console.
+	•	Sanitized filenames: Filenames are now sanitized to replace any special characters with underscores (_), preventing issues with invalid filenames.
+	•	Error handling: Improved error handling for downloading albums, retrieving images, and handling missing attributes such as MD5Sum or id.
+
 ## Usage
 * Run `python smdl.py -u USERNAME` and it will begin downloading your pictures into separate folders in the default output directory. The username is what is found in the URL, i.e. USERNAME.smugmug.com.
 * Some SmugMug sites are organized with [folders and hierarchy](https://www.smugmughelp.com/hc/en-us/articles/18212469747604-Organize-with-folders-and-hierarchy); if you would like to restrict your download to certain folders, you can directly put the relevant path into the username (USERNAME.smugmug.com/a/b/c would become `-u USERNAME/a/b/c`).
